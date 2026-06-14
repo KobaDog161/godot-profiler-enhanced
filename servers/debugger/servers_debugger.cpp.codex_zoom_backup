@@ -30,12 +30,15 @@
 
 #include "servers_debugger.h"
 
+#include "core/config/engine.h"
 #include "core/config/project_settings.h"
 #include "core/debugger/engine_debugger.h"
 #include "core/debugger/engine_profiler.h"
 #include "core/io/resource_loader.h"
 #include "core/object/script_language.h"
+#include "core/os/os.h"
 #include "servers/display/display_server.h"
+#include "servers/rendering/rendering_server.h"
 
 #define CHECK_SIZE(arr, expected, what) ERR_FAIL_COND_V_MSG((uint32_t)arr.size() < (uint32_t)(expected), false, String("Malformed ") + what + " message from script debugger, message too short. Expected size: " + itos(expected) + ", actual size: " + itos(arr.size()))
 #define CHECK_END(arr, expected, what) ERR_FAIL_COND_V_MSG((uint32_t)arr.size() > (uint32_t)expected, false, String("Malformed ") + what + " message from script debugger, message too long. Expected size: " + itos(expected) + ", actual size: " + itos(arr.size()))
@@ -97,29 +100,13 @@ Array ServersDebugger::ServersProfilerFrame::serialize() {
 		}
 	}
 
-	arr.push_back(-script_functions.size());
+	arr.push_back(script_functions.size() * 5);
 	for (int i = 0; i < script_functions.size(); i++) {
 		arr.push_back(script_functions[i].sig_id);
 		arr.push_back(script_functions[i].call_count);
 		arr.push_back(script_functions[i].self_time);
 		arr.push_back(script_functions[i].total_time);
 		arr.push_back(script_functions[i].internal_time);
-		arr.push_back(-(script_functions[i].line_timings.size() * 3 + 1));
-		for (int j = 0; j < script_functions[i].line_timings.size(); j++) {
-			arr.push_back(script_functions[i].line_timings[j].line);
-			arr.push_back(script_functions[i].line_timings[j].call_count);
-			arr.push_back(script_functions[i].line_timings[j].total_time);
-		}
-		arr.push_back(script_functions[i].callers.size() * 2);
-		for (int j = 0; j < script_functions[i].callers.size(); j++) {
-			arr.push_back(script_functions[i].callers[j].sig_id);
-			arr.push_back(script_functions[i].callers[j].call_count);
-		}
-		arr.push_back(script_functions[i].callees.size() * 2);
-		for (int j = 0; j < script_functions[i].callees.size(); j++) {
-			arr.push_back(script_functions[i].callees[j].sig_id);
-			arr.push_back(script_functions[i].callees[j].call_count);
-		}
 	}
 	return arr;
 }
@@ -154,60 +141,16 @@ bool ServersDebugger::ServersProfilerFrame::deserialize(const Array &p_arr) {
 	CHECK_SIZE(p_arr, idx + 1, "ServersProfilerFrame");
 	int func_size = p_arr[idx];
 	idx += 1;
-	const bool has_line_timings = func_size < 0;
-	const int func_count = has_line_timings ? -func_size : func_size / 5;
-	if (!has_line_timings) {
-		CHECK_SIZE(p_arr, idx + func_size, "ServersProfilerFrame");
-	}
-	for (int i = 0; i < func_count; i++) {
-		CHECK_SIZE(p_arr, idx + 5, "ServersProfilerFrame");
+	CHECK_SIZE(p_arr, idx + func_size, "ServersProfilerFrame");
+	for (int i = 0; i < func_size / 5; i++) {
 		ScriptFunctionInfo fi;
 		fi.sig_id = p_arr[idx];
 		fi.call_count = p_arr[idx + 1];
 		fi.self_time = p_arr[idx + 2];
 		fi.total_time = p_arr[idx + 3];
 		fi.internal_time = p_arr[idx + 4];
-		idx += 5;
-		if (has_line_timings) {
-			CHECK_SIZE(p_arr, idx + 1, "ServersProfilerFrame");
-			int line_data_size = p_arr[idx];
-			idx += 1;
-			const bool has_call_graph = line_data_size < 0;
-			if (has_call_graph) {
-				line_data_size = -(line_data_size + 1);
-			}
-			CHECK_SIZE(p_arr, idx + line_data_size, "ServersProfilerFrame");
-			fi.line_timings.resize(line_data_size / 3);
-			for (int j = 0; j < line_data_size / 3; j++) {
-				fi.line_timings.write[j].line = p_arr[idx];
-				fi.line_timings.write[j].call_count = p_arr[idx + 1];
-				fi.line_timings.write[j].total_time = p_arr[idx + 2];
-				idx += 3;
-			}
-			if (has_call_graph) {
-				CHECK_SIZE(p_arr, idx + 1, "ServersProfilerFrame");
-				const int caller_data_size = p_arr[idx];
-				idx += 1;
-				CHECK_SIZE(p_arr, idx + caller_data_size, "ServersProfilerFrame");
-				fi.callers.resize(caller_data_size / 2);
-				for (int j = 0; j < caller_data_size / 2; j++) {
-					fi.callers.write[j].sig_id = p_arr[idx];
-					fi.callers.write[j].call_count = p_arr[idx + 1];
-					idx += 2;
-				}
-				CHECK_SIZE(p_arr, idx + 1, "ServersProfilerFrame");
-				const int callee_data_size = p_arr[idx];
-				idx += 1;
-				CHECK_SIZE(p_arr, idx + callee_data_size, "ServersProfilerFrame");
-				fi.callees.resize(callee_data_size / 2);
-				for (int j = 0; j < callee_data_size / 2; j++) {
-					fi.callees.write[j].sig_id = p_arr[idx];
-					fi.callees.write[j].call_count = p_arr[idx + 1];
-					idx += 2;
-				}
-			}
-		}
 		script_functions.push_back(fi);
+		idx += 5;
 	}
 	CHECK_END(p_arr, idx, "ServersProfilerFrame");
 	return true;
@@ -230,7 +173,7 @@ bool ServersDebugger::VisualProfilerFrame::deserialize(const Array &p_arr) {
 	CHECK_SIZE(p_arr, size, "VisualProfilerFrame");
 	int idx = 2;
 	areas.resize(size / 3);
-	RS::FrameProfileArea *w = areas.ptrw();
+	RenderingServerTypes::FrameProfileArea *w = areas.ptrw();
 	for (int i = 0; i < size / 3; i++) {
 		w[i].name = p_arr[idx];
 		w[i].cpu_msec = p_arr[idx + 1];
@@ -252,19 +195,6 @@ class ServersDebugger::ScriptsProfiler : public EngineProfiler {
 	Vector<ScriptLanguage::ProfilingInfo *> ptrs;
 	HashMap<StringName, int> sig_map;
 	int max_frame_functions = 16;
-
-	int _ensure_signature(const StringName &p_signature) {
-		if (!sig_map.has(p_signature)) {
-			int idx = sig_map.size();
-			FunctionSignature sig;
-			sig.name = p_signature;
-			sig.id = idx;
-			EngineDebugger::get_singleton()->send_message("servers:function_signature", sig.serialize());
-			sig_map[p_signature] = idx;
-		}
-
-		return sig_map[p_signature];
-	}
 
 public:
 	void toggle(bool p_enable, const Array &p_opts) {
@@ -308,12 +238,13 @@ public:
 		// Check signatures first, and compute total time.
 		r_total = 0;
 		for (int i = 0; i < to_send; i++) {
-			_ensure_signature(ptrs[i]->signature);
-			for (int j = 0; j < ptrs[i]->callers.size(); j++) {
-				_ensure_signature(ptrs[i]->callers[j].signature);
-			}
-			for (int j = 0; j < ptrs[i]->callees.size(); j++) {
-				_ensure_signature(ptrs[i]->callees[j].signature);
+			if (!sig_map.has(ptrs[i]->signature)) {
+				int idx = sig_map.size();
+				FunctionSignature sig;
+				sig.name = ptrs[i]->signature;
+				sig.id = idx;
+				EngineDebugger::get_singleton()->send_message("servers:function_signature", sig.serialize());
+				sig_map[ptrs[i]->signature] = idx;
 			}
 			r_total += ptrs[i]->self_time;
 		}
@@ -323,37 +254,13 @@ public:
 
 		FunctionInfo *w = r_funcs.ptrw();
 		for (int i = 0; i < to_send; i++) {
-			w[i].sig_id = _ensure_signature(ptrs[i]->signature);
+			if (sig_map.has(ptrs[i]->signature)) {
+				w[i].sig_id = sig_map[ptrs[i]->signature];
+			}
 			w[i].call_count = ptrs[i]->call_count;
 			w[i].total_time = ptrs[i]->total_time / 1000000.0;
 			w[i].self_time = ptrs[i]->self_time / 1000000.0;
 			w[i].internal_time = ptrs[i]->internal_time / 1000000.0;
-			w[i].callers.clear();
-			w[i].callees.clear();
-			w[i].line_timings.resize(ptrs[i]->line_timings.size());
-			for (int j = 0; j < ptrs[i]->line_timings.size(); j++) {
-				w[i].line_timings.write[j].line = ptrs[i]->line_timings[j].line;
-				w[i].line_timings.write[j].call_count = ptrs[i]->line_timings[j].call_count;
-				w[i].line_timings.write[j].total_time = ptrs[i]->line_timings[j].total_time / 1000000.0;
-			}
-			for (int j = 0; j < ptrs[i]->callers.size(); j++) {
-				if (ptrs[i]->callers[j].call_count <= 0) {
-					continue;
-				}
-				FunctionInfo::CallInfo call_info;
-				call_info.sig_id = _ensure_signature(ptrs[i]->callers[j].signature);
-				call_info.call_count = ptrs[i]->callers[j].call_count;
-				w[i].callers.push_back(call_info);
-			}
-			for (int j = 0; j < ptrs[i]->callees.size(); j++) {
-				if (ptrs[i]->callees[j].call_count <= 0) {
-					continue;
-				}
-				FunctionInfo::CallInfo call_info;
-				call_info.sig_id = _ensure_signature(ptrs[i]->callees[j].signature);
-				call_info.call_count = ptrs[i]->callees[j].call_count;
-				w[i].callees.push_back(call_info);
-			}
 		}
 	}
 
@@ -467,7 +374,7 @@ public:
 	void add(const Array &p_data) {}
 
 	void tick(double p_frame_time, double p_process_time, double p_physics_time, double p_physics_frame_time) {
-		Vector<RS::FrameProfileArea> profile_areas = RS::get_singleton()->get_frame_profile();
+		Vector<RenderingServerTypes::FrameProfileArea> profile_areas = RS::get_singleton()->get_frame_profile();
 		ServersDebugger::VisualProfilerFrame frame;
 		if (!profile_areas.size()) {
 			return;
@@ -523,23 +430,23 @@ Error ServersDebugger::_capture(void *p_user, const String &p_cmd, const Array &
 void ServersDebugger::_send_resource_usage() {
 	ServersDebugger::ResourceUsage usage;
 
-	List<RS::TextureInfo> tinfo;
+	List<RenderingServerTypes::TextureInfo> tinfo;
 	RS::get_singleton()->texture_debug_usage(&tinfo);
 
-	for (const RS::TextureInfo &E : tinfo) {
+	for (const RenderingServerTypes::TextureInfo &E : tinfo) {
 		ServersDebugger::ResourceInfo info;
 		info.path = E.path;
 		info.vram = E.bytes;
 		info.id = E.texture;
 
 		switch (E.type) {
-			case RS::TextureType::TEXTURE_TYPE_2D:
+			case RSE::TextureType::TEXTURE_TYPE_2D:
 				info.type = "Texture2D";
 				break;
-			case RS::TextureType::TEXTURE_TYPE_3D:
+			case RSE::TextureType::TEXTURE_TYPE_3D:
 				info.type = "Texture3D";
 				break;
-			case RS::TextureType::TEXTURE_TYPE_LAYERED:
+			case RSE::TextureType::TEXTURE_TYPE_LAYERED:
 				info.type = "TextureLayered";
 				break;
 		}
@@ -557,10 +464,10 @@ void ServersDebugger::_send_resource_usage() {
 		usage.infos.push_back(info);
 	}
 
-	List<RS::MeshInfo> mesh_info;
+	List<RenderingServerTypes::MeshInfo> mesh_info;
 	RS::get_singleton()->mesh_debug_usage(&mesh_info);
 
-	for (const RS::MeshInfo &E : mesh_info) {
+	for (const RenderingServerTypes::MeshInfo &E : mesh_info) {
 		ServersDebugger::ResourceInfo info;
 		info.path = E.path;
 		// We use 64-bit integers to avoid overflow, if for whatever reason, the sum is bigger than 4GB.

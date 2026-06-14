@@ -31,17 +31,16 @@
 #include "editor_profiler.h"
 
 #include "core/io/image.h"
-#include "core/io/resource_loader.h"
+#include "core/object/callable_mp.h"
 #include "core/string/translation_server.h"
 #include "editor/editor_string_names.h"
 #include "editor/run/editor_run_bar.h"
-#include "editor/script/script_editor_plugin.h"
 #include "editor/settings/editor_settings.h"
 #include "editor/themes/editor_scale.h"
 #include "scene/gui/check_box.h"
 #include "scene/gui/flow_container.h"
+#include "scene/gui/label.h"
 #include "scene/resources/image_texture.h"
-#include "servers/display/display_server.h"
 
 void EditorProfiler::_make_metric_ptrs(Metric &m) {
 	for (int i = 0; i < m.categories.size(); i++) {
@@ -52,7 +51,7 @@ void EditorProfiler::_make_metric_ptrs(Metric &m) {
 	}
 }
 
-EditorProfiler::Metric EditorProfiler::_get_frame_metric(int index) {
+const EditorProfiler::Metric &EditorProfiler::_get_frame_metric(int index) const {
 	return frame_metrics[(frame_metrics.size() + last_metric - (total_metrics - 1) + index) % frame_metrics.size()];
 }
 
@@ -104,7 +103,6 @@ void EditorProfiler::clear() {
 	plot_sigs.clear();
 	plot_sigs.insert("physics_frame_time");
 	plot_sigs.insert("category_frame_time");
-	call_relation_highlight_signature = StringName();
 	display_internal_profiles->set_visible(EDITOR_GET("debugger/profile_native_calls"));
 
 	updating_frame = true;
@@ -149,289 +147,6 @@ String EditorProfiler::_get_time_as_text(const Metric &m, float p_time, int p_ca
 	}
 
 	return "err";
-}
-
-float EditorProfiler::_get_item_display_time(const Metric::Category::Item &p_item, int p_display_time) const {
-	float time = p_display_time == DISPLAY_SELF_TIME ? p_item.self : p_item.total;
-
-	if (p_display_time == DISPLAY_SELF_TIME && !display_internal_profiles->is_pressed()) {
-		time += p_item.internal;
-	}
-
-	return time;
-}
-
-bool EditorProfiler::_profile_item_matches_filter(const Metric::Category::Item &p_item) const {
-	if (function_filter_text.is_empty()) {
-		return true;
-	}
-
-	return (
-		p_item.name.to_lower().contains(function_filter_text) ||
-		p_item.script.to_lower().contains(function_filter_text)
-	);
-}
-
-bool EditorProfiler::_profile_item_should_swap(const Metric::Category::Item &p_left, const Metric::Category::Item &p_right, int p_display_time) const {
-	int comparison = 0;
-
-	switch (sort_column) {
-		case SORT_NAME: {
-			comparison = p_left.name.nocasecmp_to(p_right.name);
-		} break;
-
-		case SORT_CALLS: {
-			if (p_left.calls != p_right.calls) {
-				comparison = p_left.calls < p_right.calls ? -1 : 1;
-			}
-		} break;
-
-		case SORT_TIME: {
-			const float left_time = _get_item_display_time(p_left, p_display_time);
-			const float right_time = _get_item_display_time(p_right, p_display_time);
-
-			if (!Math::is_equal_approx(left_time, right_time)) {
-				comparison = left_time < right_time ? -1 : 1;
-			}
-		} break;
-	}
-
-	if (comparison == 0) {
-		comparison = p_left.name.nocasecmp_to(p_right.name);
-	}
-
-	if (comparison == 0) {
-		comparison = p_left.script.nocasecmp_to(p_right.script);
-	}
-
-	return sort_descending ? comparison > 0 : comparison < 0;
-}
-
-void EditorProfiler::_sort_profile_items(Vector<Metric::Category::Item> &r_items, int p_display_time) const {
-	for (int i = 0; i < r_items.size() - 1; i++) {
-		for (int j = i + 1; j < r_items.size(); j++) {
-			if (_profile_item_should_swap(r_items[i], r_items[j], p_display_time)) {
-				SWAP(r_items.write[i], r_items.write[j]);
-			}
-		}
-	}
-}
-
-void EditorProfiler::_function_filter_changed(const String &p_text) {
-	function_filter_text = p_text.strip_edges().to_lower();
-
-	if (last_metric >= 0) {
-		_update_frame();
-		_update_plot();
-	}
-}
-
-void EditorProfiler::_line_time_threshold_changed(double p_value) {
-	line_time_threshold_ms = MAX(0.0, p_value);
-
-	if (last_metric >= 0) {
-		_update_frame();
-	}
-}
-
-void EditorProfiler::_group_functions_by_script_toggled(bool p_toggled_on) {
-	group_functions_by_script_enabled = p_toggled_on;
-
-	if (last_metric >= 0) {
-		_update_frame();
-	}
-}
-
-void EditorProfiler::_variables_column_title_clicked(int p_column, int p_button) {
-	if ((MouseButton)p_button != MouseButton::LEFT) {
-		return;
-	}
-
-	SortColumn new_sort_column = SORT_NAME;
-
-	switch (p_column) {
-		case 1:
-			new_sort_column = SORT_TIME;
-			break;
-		case 2:
-			new_sort_column = SORT_CALLS;
-			break;
-		default:
-			new_sort_column = SORT_NAME;
-			break;
-	}
-
-	if (sort_column == new_sort_column) {
-		sort_descending = !sort_descending;
-	} else {
-		sort_column = new_sort_column;
-		sort_descending = sort_column != SORT_NAME;
-	}
-
-	_update_sort_column_titles();
-
-	if (last_metric >= 0) {
-		_update_frame();
-	}
-}
-
-void EditorProfiler::_profile_item_activated() {
-	TreeItem *item = variables->get_selected();
-	if (!item) {
-		return;
-	}
-
-	const String script_path = item->get_metadata(1);
-	const int line = item->get_metadata(2);
-
-	if (script_path.is_empty() || line <= 0) {
-		return;
-	}
-
-	Ref<Resource> script_resource = ResourceLoader::load(script_path);
-	if (script_resource.is_null()) {
-		return;
-	}
-
-	ScriptEditor *script_editor = ScriptEditor::get_singleton();
-	if (!script_editor) {
-		return;
-	}
-
-	script_editor->edit(script_resource, line - 1, 0, true);
-}
-
-void EditorProfiler::_profile_tree_gui_input(const Ref<InputEvent> &p_ev) {
-	Ref<InputEventMouseButton> mb = p_ev;
-	if (mb.is_null() || !mb->is_pressed() || mb->get_button_index() != MouseButton::RIGHT) {
-		return;
-	}
-
-	TreeItem *item = _get_profile_function_tree_item(variables->get_item_at_position(mb->get_position()));
-	if (!item) {
-		return;
-	}
-
-	call_relation_highlight_signature = item->get_metadata(0);
-	_update_call_relation_highlights();
-
-	profile_context_copy_text = item->get_text(0);
-	if (profile_context_copy_text.is_empty()) {
-		return;
-	}
-
-	profile_context_menu->clear();
-	profile_context_menu->reset_size();
-	profile_context_menu->add_icon_item(get_editor_theme_icon(SNAME("ActionCopy")), TTRC("Copy"), CONTEXT_COPY_FUNCTION_NAME);
-	profile_context_menu->set_position(variables->get_screen_position() + mb->get_position());
-	profile_context_menu->popup();
-	variables->accept_event();
-}
-
-void EditorProfiler::_profile_context_menu_id_pressed(int p_option) {
-	switch (p_option) {
-		case CONTEXT_COPY_FUNCTION_NAME: {
-			DisplayServer::get_singleton()->clipboard_set(profile_context_copy_text);
-		} break;
-	}
-}
-
-TreeItem *EditorProfiler::_get_profile_function_tree_item(TreeItem *p_item) const {
-	TreeItem *item = p_item;
-
-	while (item) {
-		if (item->get_parent() && item->get_parent()->get_parent() && item->get_metadata(0).get_type() == Variant::STRING_NAME) {
-			return item;
-		}
-		item = item->get_parent();
-	}
-
-	return nullptr;
-}
-
-void EditorProfiler::_clear_call_relation_highlights(TreeItem *p_item) {
-	if (!p_item) {
-		return;
-	}
-
-	p_item->clear_custom_bg_color(0);
-
-	TreeItem *child = p_item->get_first_child();
-	while (child) {
-		_clear_call_relation_highlights(child);
-		child = child->get_next();
-	}
-}
-
-void EditorProfiler::_apply_call_relation_highlights(TreeItem *p_item, const HashSet<StringName> &p_callers, const HashSet<StringName> &p_callees) const {
-	if (!p_item) {
-		return;
-	}
-
-	if (p_item->get_metadata(0).get_type() == Variant::STRING_NAME) {
-		const StringName signature = p_item->get_metadata(0);
-		if (p_callers.has(signature)) {
-			p_item->set_custom_bg_color(0, theme_cache.caller_bg_color);
-		} else if (p_callees.has(signature)) {
-			p_item->set_custom_bg_color(0, theme_cache.callee_bg_color);
-		}
-	}
-
-	TreeItem *child = p_item->get_first_child();
-	while (child) {
-		_apply_call_relation_highlights(child, p_callers, p_callees);
-		child = child->get_next();
-	}
-}
-
-void EditorProfiler::_update_call_relation_highlights() {
-	TreeItem *root = variables->get_root();
-	if (!root) {
-		return;
-	}
-
-	_clear_call_relation_highlights(root);
-
-	if (total_metrics <= 0) {
-		return;
-	}
-
-	if (call_relation_highlight_signature == StringName()) {
-		return;
-	}
-
-	const int cursor_metric = cursor_metric_edit->get_value() - _get_frame_metric(0).frame_number;
-	const Metric &m = _get_frame_metric(cursor_metric);
-	HashMap<StringName, Metric::Category::Item *>::ConstIterator selected_metric_item = m.item_ptrs.find(call_relation_highlight_signature);
-	if (!selected_metric_item) {
-		return;
-	}
-
-	HashSet<StringName> callers;
-	for (const StringName &caller : selected_metric_item->value->callers) {
-		callers.insert(caller);
-	}
-
-	HashSet<StringName> callees;
-	for (const StringName &callee : selected_metric_item->value->callees) {
-		callees.insert(callee);
-	}
-
-	_apply_call_relation_highlights(root, callers, callees);
-}
-
-void EditorProfiler::_update_sort_column_titles() {
-	variables->set_column_title(0, TTR("Name") + _get_sort_suffix(SORT_NAME));
-	variables->set_column_title(1, TTR("Time") + _get_sort_suffix(SORT_TIME));
-	variables->set_column_title(2, TTR("Calls") + _get_sort_suffix(SORT_CALLS));
-}
-
-String EditorProfiler::_get_sort_suffix(SortColumn p_column) const {
-	if (sort_column != p_column) {
-		return "";
-	}
-
-	return sort_descending ? " v" : " ^";
 }
 
 Color EditorProfiler::_get_color_from_signature(const StringName &p_signature) const {
@@ -523,7 +238,6 @@ void EditorProfiler::_update_plot() {
 	if (highest > 0) {
 		//means some data exists..
 		highest *= 1.2; //leave some upper room
-		highest /= Math::exp(graph_y_zoom);
 		graph_height = highest;
 
 		Vector<int> columnv;
@@ -642,46 +356,6 @@ void EditorProfiler::_update_frame() {
 	int dtime = display_time->get_selected();
 
 	for (int i = 0; i < m.categories.size(); i++) {
-		Vector<Metric::Category::Item> visible_items;
-
-		for (int j = 0; j < m.categories[i].items.size(); j++) {
-			const Metric::Category::Item &it = m.categories[i].items[j];
-
-			if (it.internal == it.total && !display_internal_profiles->is_pressed() && m.categories[i].name == "Script Functions") {
-				continue;
-			}
-
-			if (!_profile_item_matches_filter(it)) {
-				continue;
-			}
-
-			visible_items.push_back(it);
-		}
-
-		if (!function_filter_text.is_empty() && visible_items.is_empty()) {
-			continue;
-		}
-
-		_sort_profile_items(visible_items, dtime);
-		const bool should_group_by_script = group_functions_by_script_enabled && m.categories[i].name == "Script Functions";
-		HashMap<String, float> script_times;
-		HashMap<String, int> script_calls;
-
-		if (should_group_by_script) {
-			for (int j = 0; j < visible_items.size(); j++) {
-				const Metric::Category::Item &it = visible_items[j];
-				const String script_name = it.script.is_empty() ? TTR("Unknown Script") : it.script;
-
-				if (!script_times.has(script_name)) {
-					script_times[script_name] = 0.0f;
-					script_calls[script_name] = 0;
-				}
-
-				script_times[script_name] += _get_item_display_time(it, dtime);
-				script_calls[script_name] += it.calls;
-			}
-		}
-
 		TreeItem *category = variables->create_item(root);
 		category->set_cell_mode(0, TreeItem::CELL_MODE_CHECK);
 		category->set_editable(0, true);
@@ -695,30 +369,13 @@ void EditorProfiler::_update_frame() {
 			category->set_custom_color(0, _get_color_from_signature(m.categories[i].signature));
 		}
 
-		HashMap<String, TreeItem *> script_items;
+		for (int j = 0; j < m.categories[i].items.size(); j++) {
+			const Metric::Category::Item &it = m.categories[i].items[j];
 
-		for (int j = 0; j < visible_items.size(); j++) {
-			const Metric::Category::Item &it = visible_items[j];
-			TreeItem *parent_item = category;
-
-			if (should_group_by_script) {
-				const String script_name = it.script.is_empty() ? TTR("Unknown Script") : it.script;
-
-				if (!script_items.has(script_name)) {
-					TreeItem *script_item = variables->create_item(category);
-					script_item->set_text(0, script_name);
-					script_item->set_auto_translate_mode(0, AUTO_TRANSLATE_MODE_DISABLED);
-					script_item->set_text(1, _get_time_as_text(m, script_times[script_name], MAX(1, script_calls[script_name])));
-					script_item->set_text_alignment(2, HORIZONTAL_ALIGNMENT_RIGHT);
-					script_item->set_text(2, itos(script_calls[script_name]));
-					script_item->set_tooltip_text(0, script_name);
-					script_items[script_name] = script_item;
-				}
-
-				parent_item = script_items[script_name];
+			if (it.internal == it.total && !display_internal_profiles->is_pressed() && m.categories[i].name == "Script Functions") {
+				continue;
 			}
-
-			TreeItem *item = variables->create_item(parent_item);
+			TreeItem *item = variables->create_item(category);
 			item->set_cell_mode(0, TreeItem::CELL_MODE_CHECK);
 			item->set_editable(0, true);
 			item->set_text(0, it.name);
@@ -729,7 +386,10 @@ void EditorProfiler::_update_frame() {
 			item->set_text_alignment(2, HORIZONTAL_ALIGNMENT_RIGHT);
 			item->set_tooltip_text(0, it.name + "\n" + it.script + ":" + itos(it.line));
 
-			float time = _get_item_display_time(it, dtime);
+			float time = dtime == DISPLAY_SELF_TIME ? it.self : it.total;
+			if (dtime == DISPLAY_SELF_TIME && !display_internal_profiles->is_pressed()) {
+				time += it.internal;
+			}
 
 			item->set_text(1, _get_time_as_text(m, time, it.calls));
 
@@ -739,48 +399,9 @@ void EditorProfiler::_update_frame() {
 				item->set_checked(0, true);
 				item->set_custom_color(0, _get_color_from_signature(it.signature));
 			}
-
-			Vector<Metric::Category::Item::LineTiming> line_timings = it.line_timings;
-			for (int k = 0; k < line_timings.size() - 1; k++) {
-				for (int l = k + 1; l < line_timings.size(); l++) {
-					if (line_timings[k].line > line_timings[l].line) {
-						SWAP(line_timings.write[k], line_timings.write[l]);
-					}
-				}
-			}
-
-			const float threshold_seconds = line_time_threshold_ms / 1000.0f;
-			bool has_visible_line_timings = false;
-			for (int k = 0; k < line_timings.size(); k++) {
-				const Metric::Category::Item::LineTiming &line_timing = line_timings[k];
-				if (line_timing.calls <= 0 || line_timing.line <= 0) {
-					continue;
-				}
-
-				const float average_line_time = line_timing.total / line_timing.calls;
-				if (average_line_time <= threshold_seconds) {
-					continue;
-				}
-
-				TreeItem *line_item = variables->create_item(item);
-				line_item->set_text(0, vformat(TTR("Line %d"), line_timing.line));
-				line_item->set_auto_translate_mode(0, AUTO_TRANSLATE_MODE_DISABLED);
-				line_item->set_metadata(1, it.script);
-				line_item->set_metadata(2, line_timing.line);
-				line_item->set_text(1, _get_time_as_text(m, line_timing.total, line_timing.calls));
-				line_item->set_text_alignment(2, HORIZONTAL_ALIGNMENT_RIGHT);
-				line_item->set_text(2, itos(line_timing.calls));
-				line_item->set_tooltip_text(0, it.script + ":" + itos(line_timing.line));
-				has_visible_line_timings = true;
-			}
-
-			if (has_visible_line_timings) {
-				item->set_collapsed(true);
-			}
 		}
 	}
 
-	_update_call_relation_highlights();
 	updating_frame = false;
 }
 
@@ -823,7 +444,6 @@ void EditorProfiler::_notification(int p_what) {
 	switch (p_what) {
 		case NOTIFICATION_TRANSLATION_CHANGED: {
 			if (is_ready()) {
-				_update_sort_column_titles();
 				_update_frame();
 			}
 			[[fallthrough]];
@@ -837,11 +457,8 @@ void EditorProfiler::_notification(int p_what) {
 			theme_cache.seek_line_color.a = 0.8;
 			theme_cache.seek_line_hover_color = theme_cache.seek_line_color;
 			theme_cache.seek_line_hover_color.a = 0.4;
-			theme_cache.caller_bg_color = Color(0.55, 1.0, 0.62, 0.35);
-			theme_cache.callee_bg_color = Color(1.0, 0.55, 0.55, 0.35);
 
 			if (total_metrics > 0) {
-				_update_call_relation_highlights();
 				_update_plot();
 			}
 		} break;
@@ -855,19 +472,13 @@ void EditorProfiler::_graph_tex_draw() {
 	if (seeking) {
 		int frame = cursor_metric_edit->get_value() - _get_frame_metric(0).frame_number;
 		frame = frame - _get_zoom_left_border() + 1;
-		const int max_profiles_shown = MAX(1, (int)(frame_metrics.size() / Math::exp(graph_zoom)));
-		int cur_x = (frame * graph->get_size().width) / max_profiles_shown;
+		int cur_x = (frame * graph->get_size().width * Math::exp(graph_zoom)) / frame_metrics.size();
 		cur_x = CLAMP(cur_x, 0, graph->get_size().width);
 		graph->draw_line(Vector2(cur_x, 0), Vector2(cur_x, graph->get_size().y), theme_cache.seek_line_color);
 	}
 	if (hover_metric > -1) {
-		const int max_profiles_shown = MAX(1, (int)(frame_metrics.size() / Math::exp(graph_zoom)));
-		const int hover_frame = hover_metric - _get_zoom_left_border();
-
-		if (hover_frame >= 0 && hover_frame < max_profiles_shown) {
-			int cur_x = (2 * hover_frame + 1) * graph->get_size().x / (2 * max_profiles_shown) + 1;
-			graph->draw_line(Vector2(cur_x, 0), Vector2(cur_x, graph->get_size().y), theme_cache.seek_line_hover_color);
-		}
+		int cur_x = (2 * hover_metric + 1) * graph->get_size().x / (2 * frame_metrics.size()) + 1;
+		graph->draw_line(Vector2(cur_x, 0), Vector2(cur_x, graph->get_size().y), theme_cache.seek_line_hover_color);
 	}
 }
 
@@ -885,28 +496,6 @@ void EditorProfiler::_cursor_metric_changed(double) {
 	_update_frame();
 }
 
-void EditorProfiler::_set_graph_zoom(float p_zoom, int p_mouse_x) {
-	const int graph_width = MAX(1, graph->get_size().width);
-	const int old_max_profiles_shown = MAX(1, (int)(frame_metrics.size() / Math::exp(graph_zoom)));
-	const int old_left_border = _get_zoom_left_border();
-	const float mouse_ratio = CLAMP((float)p_mouse_x / graph_width, 0.0f, 1.0f);
-	const float hovered_frame = old_left_border + mouse_ratio * old_max_profiles_shown;
-
-	graph_zoom = CLAMP(p_zoom, 0.0f, 4.0f);
-
-	const int max_profiles_shown = MAX(1, (int)(frame_metrics.size() / Math::exp(graph_zoom)));
-	zoom_center = CLAMP(
-			(int)Math::round(hovered_frame + (0.5f - mouse_ratio) * max_profiles_shown),
-			max_profiles_shown / 2,
-			frame_metrics.size() - max_profiles_shown / 2);
-	_update_plot();
-}
-
-void EditorProfiler::_set_graph_y_zoom(float p_zoom) {
-	graph_y_zoom = CLAMP(p_zoom, 0.0f, 4.0f);
-	_update_plot();
-}
-
 void EditorProfiler::_graph_tex_input(const Ref<InputEvent> &p_ev) {
 	if (last_metric < 0) {
 		return;
@@ -920,18 +509,18 @@ void EditorProfiler::_graph_tex_input(const Ref<InputEvent> &p_ev) {
 	if (
 			(mb.is_valid() && button_idx == MouseButton::LEFT && mb->is_pressed()) ||
 			(mm.is_valid())) {
-		const int graph_width = MAX(1, graph->get_size().width);
-		const int max_profiles_shown = MAX(1, (int)(frame_metrics.size() / Math::exp(graph_zoom)));
-		const int mouse_x = CLAMP((int)me->get_position().x - 1, 0, graph_width - 1);
-		int metric_index = mouse_x * max_profiles_shown / graph_width + _get_zoom_left_border();
-		metric_index = CLAMP(metric_index, 0, frame_metrics.size() - 1);
-		hover_metric = metric_index;
+		int x = me->get_position().x - 1;
+		hover_metric = x * frame_metrics.size() / graph->get_size().width;
+
+		x = x * frame_metrics.size() / graph->get_size().width;
+		x = x / Math::exp(graph_zoom) + _get_zoom_left_border();
+		x = CLAMP(x, 0, frame_metrics.size() - 1);
 
 		if (mb.is_valid() || (mm->get_button_mask().has_flag(MouseButtonMask::LEFT))) {
 			updating_frame = true;
 
-			if (metric_index < total_metrics) {
-				cursor_metric_edit->set_value(_get_frame_metric(metric_index).frame_number);
+			if (x < total_metrics) {
+				cursor_metric_edit->set_value(_get_frame_metric(x).frame_number);
 			}
 			updating_frame = false;
 
@@ -952,7 +541,7 @@ void EditorProfiler::_graph_tex_input(const Ref<InputEvent> &p_ev) {
 
 	if (graph_zoom > 0 && mm.is_valid() && (mm->get_button_mask().has_flag(MouseButtonMask::MIDDLE) || mm->get_button_mask().has_flag(MouseButtonMask::RIGHT))) {
 		// Panning.
-		const int max_profiles_shown = MAX(1, (int)(frame_metrics.size() / Math::exp(graph_zoom)));
+		const int max_profiles_shown = frame_metrics.size() / Math::exp(graph_zoom);
 		pan_accumulator += (float)mm->get_relative().x * max_profiles_shown / graph->get_size().width;
 
 		if (Math::abs(pan_accumulator) > 1) {
@@ -962,20 +551,17 @@ void EditorProfiler::_graph_tex_input(const Ref<InputEvent> &p_ev) {
 		}
 	}
 
-	if (mb.is_valid() && mb->is_pressed() && button_idx == MouseButton::WHEEL_DOWN) {
+	if (button_idx == MouseButton::WHEEL_DOWN) {
 		// Zooming.
-		if (mb->is_ctrl_pressed()) {
-			_set_graph_y_zoom(graph_y_zoom - 0.10f);
-		} else {
-			_set_graph_zoom(graph_zoom - 0.10f, (int)me->get_position().x);
+		graph_zoom = MAX(-0.05 + graph_zoom, 0);
+		_update_plot();
+	} else if (button_idx == MouseButton::WHEEL_UP) {
+		if (graph_zoom == 0) {
+			zoom_center = me->get_position().x;
+			zoom_center = zoom_center * frame_metrics.size() / graph->get_size().width;
 		}
-	} else if (mb.is_valid() && mb->is_pressed() && button_idx == MouseButton::WHEEL_UP) {
-		// Zooming.
-		if (mb->is_ctrl_pressed()) {
-			_set_graph_y_zoom(graph_y_zoom + 0.10f);
-		} else {
-			_set_graph_zoom(graph_zoom + 0.10f, (int)me->get_position().x);
-		}
+		graph_zoom = MIN(0.05 + graph_zoom, 2);
+		_update_plot();
 	}
 
 	graph->queue_redraw();
@@ -1144,36 +730,6 @@ EditorProfiler::EditorProfiler() {
 	display_time->connect(SceneStringName(item_selected), callable_mp(this, &EditorProfiler::_combo_changed));
 	hb_time->add_child(display_time);
 
-	HBoxContainer *hb_filter = memnew(HBoxContainer);
-	hb_filter->add_theme_constant_override(SNAME("separation"), 2 * EDSCALE);
-	container->add_child(hb_filter);
-
-	hb_filter->add_child(memnew(Label(TTRC("Search:"))));
-
-	function_filter = memnew(LineEdit);
-	function_filter->set_accessibility_name(TTRC("Search Function"));
-	function_filter->set_placeholder(TTRC("Function name"));
-	function_filter->set_custom_minimum_size(Size2(170 * EDSCALE, 0));
-	function_filter->connect(SceneStringName(text_changed), callable_mp(this, &EditorProfiler::_function_filter_changed));
-	hb_filter->add_child(function_filter);
-
-	hb_filter->add_child(memnew(Label(TTRC("Ignore lines <= ms:"))));
-
-	line_time_threshold_edit = memnew(SpinBox);
-	line_time_threshold_edit->set_accessibility_name(TTRC("Ignore Line Time Threshold"));
-	line_time_threshold_edit->set_min(0);
-	line_time_threshold_edit->set_max(100000);
-	line_time_threshold_edit->set_step(0.01);
-	line_time_threshold_edit->set_value(line_time_threshold_ms);
-	line_time_threshold_edit->set_custom_minimum_size(Size2(90 * EDSCALE, 0));
-	line_time_threshold_edit->connect(SceneStringName(value_changed), callable_mp(this, &EditorProfiler::_line_time_threshold_changed));
-	hb_filter->add_child(line_time_threshold_edit);
-
-	group_functions_by_script = memnew(CheckButton(TTRC("Group by script")));
-	group_functions_by_script->set_pressed(group_functions_by_script_enabled);
-	group_functions_by_script->connect(SceneStringName(toggled), callable_mp(this, &EditorProfiler::_group_functions_by_script_toggled));
-	container->add_child(group_functions_by_script);
-
 	display_internal_profiles = memnew(CheckButton(TTRC("Display internal functions")));
 	display_internal_profiles->set_visible(EDITOR_GET("debugger/profile_native_calls"));
 	display_internal_profiles->set_pressed(false);
@@ -1201,32 +757,25 @@ EditorProfiler::EditorProfiler() {
 
 	variables = memnew(Tree);
 	variables->set_custom_minimum_size(Size2(320, 0) * EDSCALE);
-	variables->set_hide_folding(false);
-	variables->set_allow_rmb_select(false);
-	variables->set_allow_reselect(true);
+	variables->set_hide_folding(true);
 	h_split->add_child(variables);
 	variables->set_hide_root(true);
 	variables->set_columns(3);
 	variables->set_column_titles_visible(true);
+	variables->set_column_title(0, TTRC("Name"));
 	variables->set_column_expand(0, true);
 	variables->set_column_clip_content(0, true);
 	variables->set_column_custom_minimum_width(0, 60);
+	variables->set_column_title(1, TTRC("Time"));
 	variables->set_column_expand(1, false);
 	variables->set_column_clip_content(1, true);
 	variables->set_column_custom_minimum_width(1, 75 * EDSCALE);
+	variables->set_column_title(2, TTRC("Calls"));
 	variables->set_column_expand(2, false);
 	variables->set_column_clip_content(2, true);
 	variables->set_column_custom_minimum_width(2, 50 * EDSCALE);
-	_update_sort_column_titles();
 	variables->set_theme_type_variation("TreeSecondary");
 	variables->connect("item_edited", callable_mp(this, &EditorProfiler::_item_edited));
-	variables->connect("item_activated", callable_mp(this, &EditorProfiler::_profile_item_activated));
-	variables->connect(SceneStringName(gui_input), callable_mp(this, &EditorProfiler::_profile_tree_gui_input));
-	variables->connect("column_title_clicked", callable_mp(this, &EditorProfiler::_variables_column_title_clicked));
-
-	profile_context_menu = memnew(PopupMenu);
-	profile_context_menu->connect(SceneStringName(id_pressed), callable_mp(this, &EditorProfiler::_profile_context_menu_id_pressed));
-	variables->add_child(profile_context_menu);
 
 	graph = memnew(TextureRect);
 	graph->set_custom_minimum_size(Size2(250 * EDSCALE, 0));

@@ -33,10 +33,7 @@
 #include "scene/gui/box_container.h"
 #include "scene/gui/button.h"
 #include "scene/gui/check_button.h"
-#include "scene/gui/label.h"
-#include "scene/gui/line_edit.h"
 #include "scene/gui/option_button.h"
-#include "scene/gui/popup_menu.h"
 #include "scene/gui/spin_box.h"
 #include "scene/gui/split_container.h"
 #include "scene/gui/texture_rect.h"
@@ -63,12 +60,6 @@ public:
 			float total_time = 0; //total for category
 
 			struct Item {
-				struct LineTiming {
-					int line = 0;
-					int calls = 0;
-					float total = 0;
-				};
-
 				StringName signature;
 				String name;
 				String script;
@@ -77,9 +68,6 @@ public:
 				float total = 0;
 				float internal = 0;
 				int calls = 0;
-				Vector<LineTiming> line_timings;
-				Vector<StringName> callers;
-				Vector<StringName> callees;
 			};
 
 			Vector<Item> items;
@@ -104,21 +92,9 @@ public:
 	};
 
 private:
-	enum SortColumn {
-		SORT_NAME,
-		SORT_TIME,
-		SORT_CALLS,
-	};
-
-	enum ContextMenuAction {
-		CONTEXT_COPY_FUNCTION_NAME,
-	};
-
 	struct ThemeCache {
 		Color seek_line_color;
 		Color seek_line_hover_color;
-		Color caller_bg_color;
-		Color callee_bg_color;
 	} theme_cache;
 
 	Button *activate = nullptr;
@@ -128,23 +104,18 @@ private:
 	Vector<uint8_t> graph_image;
 
 	float graph_zoom = 0.0f;
-	float graph_y_zoom = 0.0f;
 	float pan_accumulator = 0.0f;
 	int zoom_center = -1;
 
 	Tree *variables = nullptr;
-	PopupMenu *profile_context_menu = nullptr;
 	HSplitContainer *h_split = nullptr;
 
 	HashSet<StringName> plot_sigs;
 
-	LineEdit *function_filter = nullptr;
-	SpinBox *line_time_threshold_edit = nullptr;
 	OptionButton *display_mode = nullptr;
 	OptionButton *display_time = nullptr;
 
 	CheckButton *display_internal_profiles = nullptr;
-	CheckButton *group_functions_by_script = nullptr;
 
 	SpinBox *cursor_metric_edit = nullptr;
 
@@ -163,14 +134,6 @@ private:
 	Timer *frame_delay = nullptr;
 	Timer *plot_delay = nullptr;
 
-	String function_filter_text;
-	String profile_context_copy_text;
-	StringName call_relation_highlight_signature;
-	float line_time_threshold_ms = 0.0f;
-	bool group_functions_by_script_enabled = false;
-	SortColumn sort_column = SORT_TIME;
-	bool sort_descending = true;
-
 	void _update_button_text();
 	void _update_frame();
 
@@ -181,25 +144,6 @@ private:
 	void _internal_profiles_pressed();
 
 	String _get_time_as_text(const Metric &m, float p_time, int p_calls);
-	float _get_item_display_time(const Metric::Category::Item &p_item, int p_display_time) const;
-	bool _profile_item_matches_filter(const Metric::Category::Item &p_item) const;
-	bool _profile_item_should_swap(const Metric::Category::Item &p_left, const Metric::Category::Item &p_right, int p_display_time) const;
-	void _sort_profile_items(Vector<Metric::Category::Item> &r_items, int p_display_time) const;
-	void _function_filter_changed(const String &p_text);
-	void _line_time_threshold_changed(double p_value);
-	void _group_functions_by_script_toggled(bool p_toggled_on);
-	void _variables_column_title_clicked(int p_column, int p_button);
-	void _profile_tree_gui_input(const Ref<InputEvent> &p_ev);
-	void _profile_item_activated();
-	void _profile_context_menu_id_pressed(int p_option);
-	TreeItem *_get_profile_function_tree_item(TreeItem *p_item) const;
-	void _clear_call_relation_highlights(TreeItem *p_item);
-	void _apply_call_relation_highlights(TreeItem *p_item, const HashSet<StringName> &p_callers, const HashSet<StringName> &p_callees) const;
-	void _update_call_relation_highlights();
-	void _update_sort_column_titles();
-	String _get_sort_suffix(SortColumn p_column) const;
-	void _set_graph_zoom(float p_zoom, int p_mouse_x);
-	void _set_graph_y_zoom(float p_zoom);
 
 	void _make_metric_ptrs(Metric &m);
 	void _item_edited();
@@ -218,7 +162,7 @@ private:
 
 	void _combo_changed(int);
 
-	Metric _get_frame_metric(int index);
+	const Metric &_get_frame_metric(int index) const;
 
 protected:
 	void _notification(int p_what);
